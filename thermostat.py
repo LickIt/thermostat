@@ -1,64 +1,239 @@
 #!/usr/bin/env python3
 
+import logging
+import time
 import tkinter as tk
 import tkinter.font as font
+from threading import Timer
+from typing import Callable, Any, Optional
+
+import board
+from adafruit_dht import DHT22
+from digitalio import DigitalInOut, Direction
 
 
 class Application:
-    def __init__(self, window):
+    measure_interval = 30
+    refresh_interval = 30000
+
+    def __init__(self, window: tk.Tk, dht: DHT22, relay: DigitalInOut):
         self.window = window
+        self.dht = dht
+        self.relay = relay
+        self.relay_on = False
+        self.power_on = False
+        self.power_button: tk.Button = None
+        self.temperature: Optional[float] = None
+        self.humidity: Optional[float] = None
+        self.temperature_label = tk.StringVar()
+        self.humidity_label = tk.StringVar()
+        self.error_label = tk.StringVar()
+        self.lastSuccessfulMeasure = time.time()
+        self.logger = self.create_logger()
+        self.target_temp = 24.0
+        self.target_temp_label = tk.StringVar(value=str(self.target_temp) + "\u00B0")
+
+        self.canvas = self.create_canvas(window)
+        self.info_frame = self.create_info_frame()
+        self.buttons_frame = self.create_buttons_frame()
+        self.canvas.bind("<Configure>", self.on_resize)
+
+        Timer(0, self.read_sensor_data).start()
+        self.window.after(5000, self.process_sensor_data)
+
+    @staticmethod
+    def create_logger() -> logging.Logger:
+        logger = logging.getLogger("thermostat")
+        logger.setLevel(logging.INFO)
+        log_formatter = logging.Formatter("%(asctime)s [%(threadName)-12.12s] [%(levelname)-5.5s]  %(message)s")
+
+        file_handler = logging.FileHandler("/tmp/thermostat.log", mode="a")
+        file_handler.setFormatter(log_formatter)
+        logger.addHandler(file_handler)
+
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(log_formatter)
+        logger.addHandler(console_handler)
+
+        return logger
+
+    @staticmethod
+    def create_canvas(window: tk.Tk) -> tk.Canvas:
         canvas = tk.Canvas(window)
         canvas.pack(expand=True, fill=tk.BOTH)
         canvas.update()
-        self.canvas = canvas
-        self.add_widgets()
-        canvas.bind("<Configure>", self.on_resize)
+
+        return canvas
 
     def on_resize(self, event):
         self.buttons_frame.config(width=event.height // 4)
 
-    def add_widgets(self):
-        height = self.canvas.winfo_height()
+    def create_info_frame(self) -> tk.Frame:
+        info_frame = tk.Frame(self.canvas, bg="white")
+        info_frame.pack(expand=True, fill=tk.BOTH, side=tk.LEFT)
 
-        self.info_frame = tk.Frame(self.canvas, bg="red")
-        self.info_frame.pack(expand=True, fill=tk.BOTH, side=tk.LEFT)
-        # info_frame.update()
+        readings_frame = tk.Frame(info_frame, bg="white", bd=2)
+        readings_frame.place(y=0, relheight=0.5, relwidth=0.7)
+        readings_frame.update()
 
-        self.buttons_frame = tk.Frame(self.canvas, bg="blue",  width=height//4)
-        self.buttons_frame.pack_propagate(0)
-        self.buttons_frame.pack(expand=False, fill=tk.BOTH, side=tk.RIGHT)
+        target_frame = tk.Frame(info_frame, bg="white")
+        target_frame.place(y=0, relx=0.7, relheight=0.5, relwidth=0.3)
+        target_frame.update()
 
-        myFont = font.Font(size=30)
-        # button_up = tk.Button(self.buttons_frame, text="\u02c4", bg="yellow")
-        # button_up = tk.Button(self.buttons_frame, text="\u2227", bg="yellow")
-        button_up = tk.Button(self.buttons_frame, text="\u2303", bg="yellow")
-        button_up.pack(expand=True, fill=tk.BOTH)
-        button_up.config(font = myFont)
+        error_frame = tk.Frame(info_frame, bg="white")
+        error_frame.place(rely=0.9, relheight=0.1, relwidth=1)
 
-        # button_down = tk.Button(self.buttons_frame, text="\u02c5", bg="yellow")
-        # button_down = tk.Button(self.buttons_frame, text="\u2228", bg="yellow")
-        button_down = tk.Button(self.buttons_frame, text="\u2304", bg="yellow")
-        button_down.pack(expand=True, fill=tk.BOTH)
-        button_down.config(font = myFont)
+        readings_frame_height = readings_frame.winfo_height()
+        tk.Label(readings_frame, textvariable=self.temperature_label, bg="white",
+                 font=font.Font(size=int(readings_frame_height * 0.4))).pack(side=tk.TOP)
+        tk.Label(readings_frame, textvariable=self.humidity_label, bg="white",
+                 font=font.Font(size=int(readings_frame_height * 0.25))).pack(side=tk.TOP)
 
-        button_onoff = tk.Button(
-            self.buttons_frame, text="\u23fc", bg="yellow")
-        button_onoff.pack(expand=True, fill=tk.BOTH)
-        button_onoff.config(font = myFont)
+        tk.Label(target_frame, textvariable=self.target_temp_label, bg="white",
+                 font=font.Font(size=int(target_frame.winfo_height() * 0.2))).pack(expand=True, fill=tk.BOTH)
 
-        button_configure = tk.Button(
-            self.buttons_frame, text="\u2328", bg="yellow")
-        button_configure.pack(expand=True, fill=tk.BOTH)
-        button_configure.config(font = myFont)
+        tk.Label(error_frame, fg="#c62828", font=font.Font(size=15), bg="white", textvariable=self.error_label).pack(
+            expand=True, fill=tk.BOTH)
+
+        return info_frame
+
+    def create_buttons_frame(self) -> tk.Frame:
+        height: int = self.canvas.winfo_height()
+
+        buttons_frame = tk.Frame(self.canvas, width=height // 4)
+        buttons_frame.pack_propagate(0)
+        buttons_frame.pack(expand=False, fill=tk.BOTH, side=tk.RIGHT)
+
+        self.add_button(buttons_frame, "\u25B3", self.temp_up)
+        self.add_button(buttons_frame, "\u25BD", self.temp_down)
+        self.power_button = self.add_button(buttons_frame, "OFF", self.toggle_power, fg="gray")
+        self.add_button(buttons_frame, "\u2328", None)
+
+        return buttons_frame
+
+    @staticmethod
+    def add_button(parent, text, command: Callable, font_size=30, fg="black") -> tk.Button:
+        button = tk.Button(
+            parent,
+            text=text,
+            command=command,
+            font=font.Font(size=font_size),
+            fg=fg,
+            highlightbackground="black",
+            bg="white"
+        )
+        button.pack(expand=True, fill=tk.BOTH)
+
+        return button
+
+    def temp_up(self):
+        self.target_temp += 0.5
+        self.target_temp_label.set(str(self.target_temp) + "\u00B0")
+
+    def temp_down(self):
+        self.target_temp -= 0.5
+        self.target_temp_label.set(str(self.target_temp) + "\u00B0")
+
+    def toggle_power(self):
+        if self.power_on:
+            self.relay_stop()
+            self.power_on = False
+            self.power_button.config(text="OFF", fg="gray")
+            self.logger.info("Power off")
+        else:
+            self.power_on = True
+            self.power_button.config(text="ON", fg="green")
+            self.logger.info("Power on")
+
+    def relay_start(self):
+        self.relay.value = 0
+        self.relay_on = True
+        self.logger.info("Relay on")
+
+    def relay_stop(self):
+        self.relay.value = 1
+        self.relay_on = False
+        self.logger.info("Relay off")
+
+    def read_sensor_data(self):
+        self.temperature = self.retry(lambda: self.dht.temperature, 5)
+        self.humidity = self.retry(lambda: self.dht.humidity, 1)
+
+        if self.temperature and self.humidity:
+            self.lastSuccessfulMeasure = time.time()
+
+        timer = Timer(self.measure_interval, self.read_sensor_data)
+        timer.daemon = True
+        timer.start()
+
+    def retry(self, command: Callable[[], Any], times: int, fallback: Any = None) -> Any:
+        for i in range(times):
+            try:
+                result = command()
+                if result:
+                    return result
+            except Exception as e:
+                self.logger.error(e)
+            time.sleep(2.01)
+
+        return fallback
+
+    def process_sensor_data(self):
+        # self.update_labels()
+
+        delta_t = time.time() - self.lastSuccessfulMeasure
+        if delta_t > 180:
+            self.logger.warning("Temperature sensor data older than %ss", int(delta_t))
+            if self.power_on:  # power off on unknown temperature
+                self.toggle_power()
+            self.show_error("E01 - No sensor data")
+        else:
+            self.adjust_temperature()
+            self.update_labels()
+
+        self.window.after(self.refresh_interval, self.process_sensor_data)
+
+    def adjust_temperature(self):
+        delta_t = 0.5
+        if self.power_on:
+            if self.relay_on and self.temperature > self.target_temp + delta_t:
+                self.relay_stop()
+            elif not self.relay_on and self.temperature < self.target_temp - delta_t:
+                self.relay_start()
+
+    def update_labels(self):
+        if self.temperature:
+            suffix = "\u00B0"
+            if self.relay_on:
+                suffix += "\u2191"
+            self.temperature_label.set(str(self.temperature) + suffix)
+
+        if self.humidity:
+            self.humidity_label.set(str(self.humidity) + "%")
+
+    def show_error(self, error: Optional[str] = None):
+        self.error_label.set(error)
 
 
 def main():
+    # DHT22 - pin 7 physical = BCM 4
+    # relay - pin 38 physical = BCM 20
+    dht = DHT22(board.D4)
+    relay = DigitalInOut(board.D20)
+    relay.direction = Direction.OUTPUT
+    relay.value = 1  # OFF
+
     window = tk.Tk()
     window.title("Thermostat v0.1")
-    window.geometry("800x400")
-    # window.state("zoomed")
-    Application(window)
-    window.mainloop()
+    # window.geometry("800x400")
+    # Application(window, None, None)
+    window.attributes("-zoomed", True)
+    Application(window, dht, relay)
+    try:
+        window.mainloop()
+    finally:
+        relay.value = 1  # OFF
+        # pass
 
 
 if __name__ == '__main__':
