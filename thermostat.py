@@ -2,23 +2,24 @@
 
 import logging
 import time
+import json
 import tkinter as tk
 import tkinter.font as font
+import urllib.request
 from threading import Timer
 from typing import Callable, Any, Optional
 
+# adafruit-blinka
 import board
-from adafruit_dht import DHT22
 from digitalio import DigitalInOut, Direction
 
 
 class Application:
     measure_interval = 30
-    refresh_interval = 30000
+    process_interval = 10000
 
-    def __init__(self, window: tk.Tk, dht: DHT22, relay: DigitalInOut):
+    def __init__(self, window: tk.Tk, relay: DigitalInOut):
         self.window = window
-        self.dht = dht
         self.relay = relay
         self.relay_on = False
         self.power_on = False
@@ -156,31 +157,21 @@ class Application:
         self.logger.info("Relay off")
 
     def read_sensor_data(self):
-        self.temperature = self.retry(lambda: self.dht.temperature, 5)
-        self.humidity = self.retry(lambda: self.dht.humidity, 1)
-
-        if self.temperature and self.humidity:
-            self.lastSuccessfulMeasure = time.time()
+        try:
+            with urllib.request.urlopen("http://localhost:8080") as response:
+                data = json.loads(response.read())
+                print(data)
+                self.temperature = data["temperature"]
+                self.humidity = data["humidity"]
+                self.lastSuccessfulMeasure = time.time()
+        except Exception as e:
+            self.logger.error(e)
 
         timer = Timer(self.measure_interval, self.read_sensor_data)
         timer.daemon = True
         timer.start()
 
-    def retry(self, command: Callable[[], Any], times: int, fallback: Any = None) -> Any:
-        for i in range(times):
-            try:
-                result = command()
-                if result:
-                    return result
-            except Exception as e:
-                self.logger.error(e)
-            time.sleep(2.01)
-
-        return fallback
-
     def process_sensor_data(self):
-        # self.update_labels()
-
         delta_t = time.time() - self.lastSuccessfulMeasure
         if delta_t > 180:
             self.logger.warning("Temperature sensor data older than %ss", int(delta_t))
@@ -191,7 +182,7 @@ class Application:
             self.adjust_temperature()
             self.update_labels()
 
-        self.window.after(self.refresh_interval, self.process_sensor_data)
+        self.window.after(self.process_interval, self.process_sensor_data)
 
     def adjust_temperature(self):
         delta_t = 0.5
@@ -216,9 +207,7 @@ class Application:
 
 
 def main():
-    # DHT22 - pin 7 physical = BCM 4
     # relay - pin 38 physical = BCM 20
-    dht = DHT22(board.D4)
     relay = DigitalInOut(board.D20)
     relay.direction = Direction.OUTPUT
     relay.value = 1  # OFF
@@ -226,9 +215,9 @@ def main():
     window = tk.Tk()
     window.title("Thermostat v0.1")
     # window.geometry("800x400")
-    # Application(window, None, None)
+    # Application(window, None)
     window.attributes("-zoomed", True)
-    Application(window, dht, relay)
+    Application(window, relay)
     try:
         window.mainloop()
     finally:
